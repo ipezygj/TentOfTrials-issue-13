@@ -1,0 +1,68 @@
+
+  Tent of Trials: building
+  Working directory: C:\Users\ipezy.DESKTOP-GD1DJED\Kickama\.claude\worktrees\wf_8e5917d0-a3d-9
+
+  Checking prerequisites...
+
+  ⚠ Some tools missing  -  will try anyway:
+    Rust (cargo)
+    Go (go)
+    C (GCC) (gcc)
+    C++ (GCC) (g++)
+    CMake (cmake)
+    Make (make)
+    Java (JDK) (javac)
+    Ruby (ruby)
+    Lua (luac)
+    GHC (Haskell) (ghc)
+  Not all modules will build. That's fine.
+
+  Checking encryptly diagnostics...
+  ✓ encryptly runs
+
+  Building 10 module(s) | release=False
+
+  ▸ Building backend (Rust)...
+
+  ▸ Building frontend (TypeScript)...
+       npm install...
+Traceback (most recent call last):
+  File "C:\Users\ipezy.DESKTOP-GD1DJED\Kickama\.claude\worktrees\wf_8e5917d0-a3d-9\build.py", line 947, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "C:\Users\ipezy.DESKTOP-GD1DJED\Kickama\.claude\worktrees\wf_8e5917d0-a3d-9\build.py", line 936, in main
+    success, elapsed, output = build_module(module, args.release, args.verbose)
+                               ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\ipezy.DESKTOP-GD1DJED\Kickama\.claude\worktrees\wf_8e5917d0-a3d-9\build.py", line 362, in build_module
+    install_result = run_text_process(
+        ["npm", "install"],
+    ...<4 lines>...
+        env={k: v for k, v in env.items() if k != "NODE_ENV"},
+    )
+  File "C:\Users\ipezy.DESKTOP-GD1DJED\Kickama\.claude\worktrees\wf_8e5917d0-a3d-9\build.py", line 54, in run_text_process
+    return subprocess.run(cmd, **kwargs)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\subprocess.py", line 555, in run
+    with Popen(*popenargs, **kwargs) as process:
+         ~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\subprocess.py", line 1039, in __init__
+    self._execute_child(args, executable, preexec_fn, close_fds,
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        pass_fds, cwd, env,
+                        ^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+                        gid, gids, uid, umask,
+                        ^^^^^^^^^^^^^^^^^^^^^^
+                        start_new_session, process_group)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\subprocess.py", line 1553, in _execute_child
+    hp, ht, pid, tid = _winapi.CreateProcess(executable, args,
+                       ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+                             # no special security
+                             ^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+                             cwd,
+                             ^^^^
+                             startupinfo)
+                             ^^^^^^^^^^^^
+FileNotFoundError: [WinError 2] The system cannot find the file specified

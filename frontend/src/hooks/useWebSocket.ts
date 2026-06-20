@@ -177,6 +177,12 @@ export function useWebSocket(options: WSOptions) {
       return;
     }
 
+    // Clear any pending reconnect timer before creating a new connection
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
     updateState({ connectionState: 'connecting', reconnectAttempt: reconnectAttemptRef.current });
 
     try {
@@ -274,7 +280,7 @@ export function useWebSocket(options: WSOptions) {
       }
       scheduleReconnect();
     }
-  }, [mergedOptions, sendMessage, updateState, state.totalMessagesReceived]);
+  }, [mergedOptions, sendMessage, updateState, state.totalMessagesReceived, startPing, clearPongTimeout]);
 
   const disconnect = useCallback(() => {
     if (reconnectTimerRef.current) {
@@ -293,6 +299,12 @@ export function useWebSocket(options: WSOptions) {
     if (!mergedOptions.reconnect || reconnectAttemptRef.current >= mergedOptions.maxReconnectAttempts) {
       updateState({ connectionState: 'error' });
       return;
+    }
+
+    // Clear any pending reconnect timer to prevent stale reconnects
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
     }
 
     const delay = Math.min(
@@ -368,7 +380,7 @@ export function useWebSocket(options: WSOptions) {
       mountedRef.current = false;
       disconnect();
     };
-  }, []);
+  }, [mergedOptions.autoConnect, mergedOptions.url, connect, disconnect]);
 
   return {
     ...state,
