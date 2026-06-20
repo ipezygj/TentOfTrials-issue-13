@@ -276,6 +276,80 @@ Audit logs are retained for 365 days and include:
 | Penetration test | Quarterly | External vendor |
 | Compliance audit | Annually | External auditor |
 
+## Build Diagnostics Management
+
+### Diagnostic Artifacts
+
+The build system generates diagnostic bundles in the `diagnostic/` directory whenever you run
+`python3 build.py`. Each build generates:
+
+- `build-COMMIT_ID.logd` - Encrypted diagnostic bundle (contains logs and system info)
+- `build-COMMIT_ID.json` - Metadata file (build status, artifact locations, etc.)
+
+When diagnostic logs exceed 40 MiB, they are automatically split into chunks:
+- `build-COMMIT_ID-part001.logd`
+- `build-COMMIT_ID-part002.logd`
+- etc.
+
+### Cleaning Up Stale Diagnostics
+
+Over time, the `diagnostic/` directory can accumulate stale partial `.logd` chunks and old
+metadata files from interrupted runs. To clean these up without affecting current diagnostics:
+
+#### Dry-run mode (recommended first step)
+
+List stale diagnostic artifacts without deleting anything:
+
+```bash
+python3 build.py --cleanup-diagnostics
+```
+
+This shows what would be removed, including:
+- Old complete diagnostic bundles from previous commits
+- Partial chunks from interrupted builds (with `-part` suffix)
+- Old metadata JSON files
+
+The current commit's diagnostics are **never** touched.
+
+#### Apply mode
+
+Actually delete the stale artifacts:
+
+```bash
+python3 build.py --cleanup-diagnostics --cleanup-apply
+```
+
+**Important notes:**
+- The current commit's artifacts are always preserved
+- The fallback commit ID (`build-00000000.*`) is never deleted (used when git is unavailable)
+- Chunked diagnostics are properly handled as a complete set
+
+#### Size reporting
+
+Both modes report the total space that will be freed or was freed:
+
+```
+Diagnostic cleanup (preview mode)...
+  Found 5 stale artifact(s) (127.3 MiB)
+  Run with --cleanup-apply to delete these artifacts
+```
+
+### Maintenance Recommendations
+
+- **Weekly**: Run `python3 build.py --cleanup-diagnostics` to monitor accumulation
+- **Monthly**: Review diagnostic disk usage and run apply mode if space is needed
+- **After CI/CD issues**: Check for stale partial chunks and clean them up
+
+### Diagnostic Preservation Policy
+
+The current commit's diagnostic artifacts are preserved indefinitely because they are
+required to:
+- Reproduce the build environment
+- Verify build integrity
+- Investigate issues in the specific build
+
+Old commits' diagnostics can be safely removed once their build results are no longer needed.
+
 ## Troubleshooting
 
 ### Common Issues

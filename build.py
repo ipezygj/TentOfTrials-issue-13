@@ -84,6 +84,90 @@ def diagnostic_paths_for_commit() -> tuple[Path, Path, str]:
     return logd_path, metadata_path, commit_id
 
 
+def get_stale_diagnostic_artifacts() -> list[Path]:
+    """Find stale diagnostic artifacts (partial .logd chunks and old metadata files).
+
+    Returns a list of paths that are NOT the current commit's artifacts.
+    Excludes build-00000000.* files (fallback when git is unavailable).
+    """
+    if not DIAGNOSTIC_DIR.exists():
+        return []
+
+    current_logd, current_metadata, current_commit = diagnostic_paths_for_commit()
+    stale = []
+
+    # Find all diagnostic artifacts
+    for artifact in DIAGNOSTIC_DIR.glob("build-*.logd"):
+        # Skip current commit's artifacts
+        if artifact == current_logd or artifact.name.startswith(f"build-{current_commit}-part"):
+            continue
+        # Skip the fallback commit ID
+        if "build-00000000" in artifact.name:
+            continue
+        stale.append(artifact)
+
+    # Find partial chunks from incomplete runs (those with -part suffix but not current)
+    for chunk in DIAGNOSTIC_DIR.glob("build-*-part*.logd"):
+        if not chunk.name.startswith(f"build-{current_commit}-part"):
+            # Skip the fallback commit ID
+            if "build-00000000" not in chunk.name:
+                stale.append(chunk)
+
+    # Find old metadata JSON files
+    for metadata in DIAGNOSTIC_DIR.glob("build-*.json"):
+        if metadata != current_metadata and not metadata.name.startswith("build-00000000"):
+            stale.append(metadata)
+
+    return sorted(set(stale))
+
+
+def cleanup_stale_diagnostics(dry_run: bool = True, verbose: bool = False) -> tuple[list[Path], int]:
+    """Clean up stale diagnostic artifacts.
+
+    Args:
+        dry_run: If True, only report what would be deleted (default). If False, actually delete.
+        verbose: If True, print detailed output for each operation.
+
+    Returns:
+        A tuple of (deleted_paths, total_bytes_freed)
+    """
+    stale = get_stale_diagnostic_artifacts()
+    deleted = []
+    total_bytes = 0
+
+    for artifact in stale:
+        try:
+            if artifact.is_file():
+                size = artifact.stat().st_size
+                total_bytes += size
+                if not dry_run:
+                    artifact.unlink()
+                    deleted.append(artifact)
+                else:
+                    deleted.append(artifact)
+                if verbose:
+                    size_kb = size / 1024.0
+                    action = "would remove" if dry_run else "removed"
+                    print(f"  {action}: {artifact.relative_to(ROOT)} ({size_kb:.1f} KiB)")
+            elif artifact.is_dir():
+                size = sum(f.stat().st_size for f in artifact.rglob("*") if f.is_file())
+                total_bytes += size
+                if not dry_run:
+                    shutil.rmtree(artifact)
+                    deleted.append(artifact)
+                else:
+                    deleted.append(artifact)
+                if verbose:
+                    size_kb = size / 1024.0
+                    action = "would remove" if dry_run else "removed"
+                    print(f"  {action}: {artifact.relative_to(ROOT)} ({size_kb:.1f} KiB)")
+        except Exception as e:
+            if verbose:
+                print(f"  error processing {artifact}: {e}")
+
+    return deleted, total_bytes
+
+
 def split_diagnostic_logd(logd_path: Path, chunk_size: int = DIAGNOSTIC_CHUNK_SIZE) -> list[Path]:
     """Split an oversized .logd into numbered .logd chunks and remove the original."""
     if logd_path.stat().st_size <= chunk_size:
@@ -821,12 +905,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 build.py                    Build all modules
-  python3 build.py -m backend         Build only backend
-  python3 build.py -m frontend,market Build frontend and market
-  python3 build.py --clean            Clean all artifacts
-  python3 build.py --release          Release build (Rust only)
-  python3 build.py --verbose          Verbose output
+  python3 build.py                       Build all modules
+  python3 build.py -m backend            Build only backend
+  python3 build.py -m frontend,market    Build frontend and market
+  python3 build.py --clean               Clean all artifacts
+  python3 build.py --release             Release build (Rust only)
+  python3 build.py --verbose             Verbose output
+  python3 build.py --cleanup-diagnostics List stale diagnostic artifacts (dry-run)
+  python3 build.py --cleanup-diagnostics --cleanup-apply Delete stale diagnostics
 
 Diagnostic bundle:
   python3 build.py
@@ -853,6 +939,14 @@ Diagnostic bundle:
         "--list", action="store_true",
         help="List available modules and exit",
     )
+    parser.add_argument(
+        "--cleanup-diagnostics", action="store_true",
+        help="Clean up stale diagnostic artifacts (dry-run by default)",
+    )
+    parser.add_argument(
+        "--cleanup-apply", action="store_true",
+        help="Actually delete stale diagnostics (use with --cleanup-diagnostics)",
+    )
 
     args = parser.parse_args()
 
@@ -866,6 +960,24 @@ Diagnostic bundle:
             print(f"    {color(m.name, Colors.CYAN)} ({m.language})")
             print(f"      dir: {m.dir.relative_to(ROOT)}")
             print(f"      build: {' '.join(m.build_cmd)}")
+        return 0
+
+    if args.cleanup_diagnostics:
+        dry_run = not args.cleanup_apply
+        action = "preview" if dry_run else "cleanup"
+        print(f"\n  {color(f'Diagnostic cleanup ({action} mode)...', Colors.CYAN)}")
+        deleted, total_bytes = cleanup_stale_diagnostics(dry_run=dry_run, verbose=True)
+        if deleted:
+            total_mb = total_bytes / (1024.0 * 1024.0)
+            count = len(deleted)
+            print(f"\n  {color(f'Found {count} stale artifact(s)', Colors.YELLOW)} ({total_mb:.1f} MiB)")
+            if dry_run:
+                print(f"  {color('Run with --cleanup-apply to delete these artifacts', Colors.GRAY)}")
+                print(f"  {color('Example: python3 build.py --cleanup-diagnostics --cleanup-apply', Colors.GRAY)}")
+            else:
+                print(f"  {color('Stale artifacts deleted', Colors.GREEN)}")
+        else:
+            print(f"  {color('No stale diagnostic artifacts found', Colors.GREEN)}")
         return 0
 
     print(f"  {color('Checking prerequisites...', Colors.GRAY)}")
