@@ -7,23 +7,119 @@
  * category, and custom rendering of asset items. It can be used as a
  * dropdown, a modal picker, or an inline selector.
  *
- * The fuzzy search uses a simple substring matching algorithm with
- * prefix priority. Results are ranked by:
- *   - Exact symbol match (highest priority)
- *   - Symbol prefix match
- *   - Name substring match
- *   - Symbol substring match
- *   - Category match (lowest priority)
+ * The search algorithm uses a multi-tier scoring system with typo tolerance.
+ * Results are ranked by:
+ *   1. Exact symbol match (score: 100)
+ *   2. Symbol prefix match (score: 80)
+ *   3. Symbol substring match (score: 60)
+ *   4. Name prefix match (score: 40)
+ *   5. Name substring match (score: 20)
+ *   6. Typo-tolerant symbol match using Levenshtein distance (score: 10-15)
+ *   7. Partial word matches using trigram similarity (score: 5-12)
+ *   8. Typo-tolerant name match using Levenshtein distance (score: 5-10)
  *
- * TODO: The fuzzy search doesn't handle typos or partial word matches
- * well. A user searching for "Bitcoin" will find it, but "Bitocin"
- * won't match anything. The search should use Levenshtein distance
- * or trigram similarity for typo tolerance. The search improvement
- * was requested by the customer support team after receiving multiple
- * tickets about "the search not working" which were actually typos.
+ * Typo tolerance handles common one- or two-character edits (insertions,
+ * deletions, substitutions) while being strict with very short queries
+ * (< 3 characters) to avoid broad unrelated matches.
  */
 
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
+
+// ---------------------------------------------------------------------------
+// UTILITIES
+// ---------------------------------------------------------------------------
+
+/**
+ * Calculate Levenshtein distance between two strings.
+ * Returns the minimum number of single-character edits needed to transform
+ * one string into another.
+ */
+function levenshteinDistance(a: string, b: string): number {
+  const aLen = a.length;
+  const bLen = b.length;
+  const matrix: number[][] = Array(aLen + 1)
+    .fill(null)
+    .map(() => Array(bLen + 1).fill(0));
+
+  for (let i = 0; i <= aLen; i++) matrix[i][0] = i;
+  for (let j = 0; j <= bLen; j++) matrix[0][j] = j;
+
+  for (let i = 1; i <= aLen; i++) {
+    for (let j = 1; j <= bLen; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return matrix[aLen][bLen];
+}
+
+/**
+ * Calculate typo tolerance score based on Levenshtein distance.
+ * Returns a score between 0 and 1, where 1.0 is a perfect match
+ * and values close to 0 indicate very dissimilar strings.
+ * Only returns non-zero scores for strings with reasonable similarity
+ * (distance <= length of shorter string / 2, capped at 2 edits for short queries).
+ */
+function getTypoToleranceScore(query: string, target: string): number {
+  if (!query || !target) return 0;
+
+  const distance = levenshteinDistance(query.toLowerCase(), target.toLowerCase());
+  const minLen = Math.min(query.length, target.length);
+
+  // For very short queries (< 3 chars), be strict: only allow exact or 1-edit matches
+  if (minLen <= 2) {
+    if (distance === 0) return 1.0;
+    if (distance === 1 && minLen === 2) return 0.7;
+    return 0;
+  }
+
+  // For longer queries, allow up to 2 edits or 50% of shortest length
+  const maxDistance = Math.min(2, Math.floor(minLen / 2));
+  if (distance <= maxDistance) {
+    // Score decreases with distance: perfect=1.0, at max distance=0.3
+    return Math.max(0.3, 1.0 - distance / (maxDistance + 1));
+  }
+
+  return 0;
+}
+
+/**
+ * Calculate trigram similarity for partial word matching.
+ * Useful for catching typos in individual components of names.
+ */
+function getTrigramScore(query: string, target: string): number {
+  if (!query || !target || query.length < 2 || target.length < 2) return 0;
+
+  query = query.toLowerCase();
+  target = target.toLowerCase();
+
+  // Extract trigrams from both strings
+  const getTrigrams = (s: string): Set<string> => {
+    const trigrams = new Set<string>();
+    for (let i = 0; i <= s.length - 3; i++) {
+      trigrams.add(s.substring(i, i + 3));
+    }
+    return trigrams;
+  };
+
+  const queryTrigrams = getTrigrams(query);
+  const targetTrigrams = getTrigrams(target);
+
+  if (queryTrigrams.size === 0 || targetTrigrams.size === 0) return 0;
+
+  // Calculate Jaccard similarity: intersection / union
+  let intersection = 0;
+  for (const t of queryTrigrams) {
+    if (targetTrigrams.has(t)) intersection++;
+  }
+
+  const union = queryTrigrams.size + targetTrigrams.size - intersection;
+  return intersection / union;
+}
 
 // ---------------------------------------------------------------------------
 // TYPES
@@ -120,11 +216,42 @@ export function AssetSelector({
       const score = (asset: Asset): number => {
         const symbol = asset.symbol.toLowerCase();
         const name = asset.name.toLowerCase();
+
+        // Exact symbol match (highest priority)
         if (symbol === query) return 100;
+        // Symbol prefix match
         if (symbol.startsWith(query)) return 80;
+        // Symbol substring match
         if (symbol.includes(query)) return 60;
+        // Name prefix match
         if (name.startsWith(query)) return 40;
+        // Name substring match
         if (name.includes(query)) return 20;
+
+        // Typo-tolerant scoring: apply to both symbol and name
+        const symbolTypoScore = getTypoToleranceScore(query, symbol);
+        const nameTypoScore = getTypoToleranceScore(query, name);
+
+        // Symbol typo match scores between 10-15 depending on accuracy
+        if (symbolTypoScore > 0) {
+          return Math.round(10 + symbolTypoScore * 5);
+        }
+
+        // Trigram similarity for partial word matches
+        const symbolTrigramScore = getTrigramScore(query, symbol);
+        const nameTrigramScore = getTrigramScore(query, name);
+        const maxTrigramScore = Math.max(symbolTrigramScore, nameTrigramScore);
+
+        // Trigram matches score between 5-12
+        if (maxTrigramScore > 0.4) {
+          return Math.round(5 + maxTrigramScore * 7);
+        }
+
+        // Name typo match scores between 5-10
+        if (nameTypoScore > 0) {
+          return Math.round(5 + nameTypoScore * 5);
+        }
+
         return 0;
       };
       filtered.sort((a, b) => score(b) - score(a));
