@@ -395,3 +395,132 @@ Send an authentication message after connecting:
 | `account.orders` | User's order updates | Real-time |
 | `account.positions` | User's position updates | Real-time |
 | `account.notifications` | User notifications | Real-time |
+
+## Frontend WebSocket Client
+
+The frontend provides a reusable `WebSocketClient` class for managing WebSocket connections with automatic reconnection and backoff logic.
+
+### Features
+
+- **Exponential backoff with jitter**: Prevents thundering herd problem during reconnects
+- **Max delay cap**: Delays cap at 30 seconds to avoid excessive wait times
+- **Connection state tracking**: Exposes `connectionState` getter for UI feedback
+- **Message queue**: Queues messages sent while disconnected for delivery after reconnect
+- **Subscription management**: Multiplexed channel subscriptions with automatic resubscription
+- **Heartbeat support**: Built-in ping/pong with latency tracking
+- **Stable connection detection**: Resets reconnect counter after 30s of stability
+
+### Basic Usage
+
+```typescript
+import { WebSocketClient } from '@/services/websocket';
+
+const client = new WebSocketClient({
+  url: 'wss://api.example.com/ws',
+  onStateChange: (state) => {
+    console.log('Connection state:', state);
+  },
+  onMessage: (message) => {
+    console.log('Received:', message);
+  },
+});
+
+client.connect();
+
+// Send a message
+client.send({
+  type: 'subscribe',
+  channel: 'market.ticker',
+  payload: { instrument: 'BTC-USD' },
+});
+
+// Subscribe to a channel
+client.subscribe('market.ticker', (data) => {
+  console.log('Ticker update:', data);
+});
+
+// Clean up
+client.destroy();
+```
+
+### React Hook Usage
+
+```typescript
+import { useEffect, useState } from 'react';
+import { WebSocketClient } from '@/services/websocket';
+
+function useWebSocket(url: string) {
+  const [client] = useState(() => new WebSocketClient({ url }));
+  const [state, setState] = useState(client.connectionState);
+
+  useEffect(() => {
+    const handleStateChange = (newState) => setState(newState);
+    client.options.onStateChange = handleStateChange;
+    client.connect();
+
+    return () => client.destroy();
+  }, [client]);
+
+  return { client, connectionState: state };
+}
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `url` | `string` | **required** | WebSocket server URL |
+| `protocols` | `string \| string[]` | `undefined` | WebSocket sub-protocols |
+| `reconnect` | `boolean` | `true` | Enable automatic reconnection |
+| `maxReconnectAttempts` | `number` | `10` | Max reconnection attempts before giving up |
+| `reconnectBaseDelay` | `number` | `1000` | Base delay in ms for first reconnect |
+| `reconnectMaxDelay` | `number` | `30000` | Max delay cap in ms |
+| `reconnectJitter` | `number` | `1000` | Random jitter range in ms |
+| `stableConnectionThreshold` | `number` | `30000` | Time in ms before resetting reconnect counter |
+| `pingInterval` | `number` | `30000` | Heartbeat ping interval in ms |
+| `pongTimeout` | `number` | `10000` | Timeout for pong response in ms |
+| `messageQueueSize` | `number` | `100` | Max queued messages while disconnected |
+| `debug` | `boolean` | `false` | Enable debug logging |
+
+### Reconnection Strategy
+
+The client uses **truncated exponential backoff with jitter**:
+
+```
+delay = min(base * 2^attempt, maxDelay) + random(0, jitter)
+```
+
+Example delays with defaults:
+- Attempt 0: 1000-2000ms
+- Attempt 1: 2000-3000ms
+- Attempt 2: 4000-5000ms
+- Attempt 3: 8000-9000ms
+- Attempt 4+: 30000-31000ms (capped)
+
+After a stable connection (30s by default), the attempt counter resets to 0, ensuring transient gateway restarts don't permanently degrade reconnection speed.
+
+### Connection States
+
+- `disconnected`: Not connected, no reconnect scheduled
+- `connecting`: Initial connection attempt in progress
+- `connected`: Successfully connected and ready
+- `reconnecting`: Disconnected, waiting to reconnect
+- `error`: Max reconnect attempts reached or fatal error
+
+### Testing
+
+Tests are located in `frontend/src/services/__tests__/websocket.test.ts` and cover:
+- Backoff delay calculation
+- Jitter distribution
+- Max delay capping
+- State transitions
+- Message queueing
+- Subscription management
+
+Run tests with:
+```bash
+cd frontend
+npm run test        # Watch mode
+npm run test:run    # Single run
+npm run test:ui     # UI mode
+```
