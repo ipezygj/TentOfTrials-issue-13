@@ -14,6 +14,17 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// HeartbeatInterval defines how often to send ping frames to clients
+	HeartbeatInterval = 30 * time.Second
+	// IdleTimeout defines how long a client can be idle before disconnecting
+	IdleTimeout = 5 * time.Minute
+	// ReadDeadline defines the timeout for reading messages
+	ReadDeadline = 60 * time.Second
+	// WriteDeadline defines the timeout for writing messages
+	WriteDeadline = 10 * time.Second
+)
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -21,12 +32,13 @@ var upgrader = websocket.Upgrader{
 }
 
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	subs     map[types.Symbol]struct{}
-	remote   string
-	mu       sync.Mutex
+	hub          *Hub
+	conn         *websocket.Conn
+	send         chan []byte
+	subs         map[types.Symbol]struct{}
+	remote       string
+	mu           sync.Mutex
+	lastActivity time.Time
 }
 
 type Hub struct {
@@ -136,17 +148,18 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		hub:    s.hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		subs:   make(map[types.Symbol]struct{}),
-		remote: r.RemoteAddr,
+		hub:          s.hub,
+		conn:         conn,
+		send:         make(chan []byte, 256),
+		subs:         make(map[types.Symbol]struct{}),
+		remote:       r.RemoteAddr,
+		lastActivity: time.Now(),
 	}
 
 	s.hub.register <- client
 
-	go client.writePump()
-	go client.readPump()
+	go client.writePump(s.logger)
+	go client.readPump(s.logger)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -169,24 +182,41 @@ func (s *Server) handleGetDepth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "depth endpoint"})
 }
 
-func (c *Client) readPump() {
+func (c *Client) readPump(logger *zap.Logger) {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
 
 	c.conn.SetReadLimit(65536)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.mu.Lock()
+		c.lastActivity = time.Now()
+		c.mu.Unlock()
+		c.conn.SetReadDeadline(time.Now().Add(ReadDeadline))
+		logger.Debug("pong received from client",
+			zap.String("remote", c.remote),
+		)
 		return nil
 	})
 
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				logger.Error("websocket error",
+					zap.String("remote", c.remote),
+					zap.Error(err),
+				)
+			}
 			break
 		}
+
+		// Update last activity time on message receipt
+		c.mu.Lock()
+		c.lastActivity = time.Now()
+		c.mu.Unlock()
 
 		var event map[string]interface{}
 		if err := json.Unmarshal(message, &event); err != nil {
@@ -199,17 +229,19 @@ func (c *Client) readPump() {
 	}
 }
 
-func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+func (c *Client) writePump(logger *zap.Logger) {
+	heartbeatTicker := time.NewTicker(HeartbeatInterval)
+	idleCheckTicker := time.NewTicker(HeartbeatInterval)
 	defer func() {
-		ticker.Stop()
+		heartbeatTicker.Stop()
+		idleCheckTicker.Stop()
 		c.conn.Close()
 	}()
 
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			c.conn.SetWriteDeadline(time.Now().Add(WriteDeadline))
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
@@ -218,9 +250,31 @@ func (c *Client) writePump() {
 				return
 			}
 
-		case <-ticker.C:
-			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		case <-heartbeatTicker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(WriteDeadline))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				logger.Error("failed to send heartbeat ping",
+					zap.String("remote", c.remote),
+					zap.Error(err),
+				)
+				return
+			}
+			logger.Debug("heartbeat ping sent",
+				zap.String("remote", c.remote),
+			)
+
+		case <-idleCheckTicker.C:
+			c.mu.Lock()
+			timeSinceLastActivity := time.Since(c.lastActivity)
+			c.mu.Unlock()
+
+			if timeSinceLastActivity > IdleTimeout {
+				logger.Info("idle client disconnected",
+					zap.String("remote", c.remote),
+					zap.Duration("idle_duration", timeSinceLastActivity),
+				)
+				c.conn.SetWriteDeadline(time.Now().Add(WriteDeadline))
+				c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "idle timeout"))
 				return
 			}
 		}
