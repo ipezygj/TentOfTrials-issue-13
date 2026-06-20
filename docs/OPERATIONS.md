@@ -37,6 +37,63 @@ The health check returns a 200 OK response with a JSON body:
 }
 ```
 
+### WebSocket Heartbeat and Idle Connection Management
+
+The Market Engine WebSocket server implements heartbeat and idle connection detection to clean up stale connections and prevent resource leaks.
+
+#### Heartbeat Configuration
+
+The WebSocket server sends ping frames to all connected clients on a configurable interval:
+
+- **Default interval**: 30 seconds
+- **Configuration**: Set the `WS_HEARTBEAT_INTERVAL_SECS` environment variable to change the interval (in seconds)
+- **Example**: `export WS_HEARTBEAT_INTERVAL_SECS=45` sets the interval to 45 seconds
+
+```bash
+# Set custom heartbeat interval to 45 seconds
+export WS_HEARTBEAT_INTERVAL_SECS=45
+
+# Start the service
+./market-engine
+```
+
+#### Idle Connection Detection
+
+The server automatically closes connections that do not respond with a pong frame within 2 heartbeat intervals:
+
+- **Threshold**: `2 × heartbeat_interval`
+- **Default threshold**: 60 seconds (2 × 30s)
+- **Monitoring**: Idle connection closures are logged with the client's remote address and last pong timestamp
+
+Example: With a 30-second heartbeat interval:
+1. Client receives ping at t=0s
+2. Client responds with pong at t=0s (connection is healthy)
+3. Client receives next ping at t=30s
+4. If no pong is received by t=60s, the connection is considered idle and closed
+5. Idle check runs every `2 × heartbeat_interval` seconds
+
+#### Behavior
+
+- All clients receive ping frames sent by the server at regular intervals
+- Clients that are responsive send a pong frame in response (handled by WebSocket library)
+- Clients that do not send a pong within the idle threshold are forcefully disconnected
+- Dead connections are removed from memory, freeing resources
+
+#### Logging
+
+Idle connection closures are logged at INFO level:
+
+```
+"msg":"closing idle connection","level":"info","remote":"192.168.1.100:54321","last_pong":"2024-01-15T10:00:30Z"
+```
+
+Client connections and disconnections are also logged:
+
+```
+"msg":"client connected","level":"info","remote":"192.168.1.100:54321","total":42
+"msg":"client disconnected","level":"info","remote":"192.168.1.100:54321","total":41
+```
+
 ### Prometheus Metrics
 
 Each service exposes Prometheus metrics at `/metrics` on the same port as the

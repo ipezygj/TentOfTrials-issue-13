@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,22 +22,41 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
+// getHeartbeatInterval returns the configured heartbeat interval in seconds,
+// reading from WS_HEARTBEAT_INTERVAL_SECS environment variable (default: 30s).
+func getHeartbeatInterval() time.Duration {
+	intervalStr := os.Getenv("WS_HEARTBEAT_INTERVAL_SECS")
+	if intervalStr == "" {
+		return 30 * time.Second
+	}
+	seconds, err := strconv.Atoi(intervalStr)
+	if err != nil || seconds <= 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	subs     map[types.Symbol]struct{}
-	remote   string
-	mu       sync.Mutex
+	hub             *Hub
+	conn            *websocket.Conn
+	send            chan []byte
+	subs            map[types.Symbol]struct{}
+	remote          string
+	mu              sync.Mutex
+	lastPongTime    time.Time
+	heartbeatTicker *time.Ticker
 }
 
 type Hub struct {
-	clients    map[*Client]struct{}
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan []byte
-	logger     *zap.Logger
-	mu         sync.RWMutex
+	clients           map[*Client]struct{}
+	register          chan *Client
+	unregister        chan *Client
+	broadcast         chan []byte
+	logger            *zap.Logger
+	mu                sync.RWMutex
+	heartbeatInterval time.Duration
+	idleCheckTicker   *time.Ticker
+	done              chan struct{}
 }
 
 type Server struct {
@@ -47,16 +68,24 @@ type Server struct {
 }
 
 func NewHub(logger *zap.Logger) *Hub {
+	heartbeatInterval := getHeartbeatInterval()
 	return &Hub{
-		clients:    make(map[*Client]struct{}),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		broadcast:  make(chan []byte, 256),
-		logger:     logger,
+		clients:           make(map[*Client]struct{}),
+		register:          make(chan *Client),
+		unregister:        make(chan *Client),
+		broadcast:         make(chan []byte, 256),
+		logger:            logger,
+		heartbeatInterval: heartbeatInterval,
+		idleCheckTicker:   time.NewTicker(heartbeatInterval * 2),
+		done:              make(chan struct{}),
 	}
 }
 
+// Run starts the hub's main event loop.
+// It processes client registrations, unregistrations, broadcasts, and idle connection checks.
 func (h *Hub) Run() {
+	defer h.idleCheckTicker.Stop()
+
 	for {
 		select {
 		case client := <-h.register:
@@ -73,6 +102,9 @@ func (h *Hub) Run() {
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				if client.heartbeatTicker != nil {
+					client.heartbeatTicker.Stop()
+				}
 			}
 			h.mu.Unlock()
 			h.logger.Info("client disconnected",
@@ -86,13 +118,62 @@ func (h *Hub) Run() {
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					// Client's send channel is full, close and remove it
+					h.mu.RUnlock()
+					h.mu.Lock()
+					if _, ok := h.clients[client]; ok {
+						delete(h.clients, client)
+						close(client.send)
+						if client.heartbeatTicker != nil {
+							client.heartbeatTicker.Stop()
+						}
+					}
+					h.mu.Unlock()
+					h.mu.RLock()
 				}
 			}
 			h.mu.RUnlock()
+
+		case <-h.idleCheckTicker.C:
+			h.checkIdleConnections()
+
+		case <-h.done:
+			return
 		}
 	}
+}
+
+// checkIdleConnections closes connections that haven't received a pong
+// within the last 2 heartbeat intervals.
+func (h *Hub) checkIdleConnections() {
+	threshold := time.Now().Add(-2 * h.heartbeatInterval)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for client := range h.clients {
+		client.mu.Lock()
+		lastPong := client.lastPongTime
+		client.mu.Unlock()
+
+		if !lastPong.IsZero() && lastPong.Before(threshold) {
+			h.logger.Info("closing idle connection",
+				zap.String("remote", client.remote),
+				zap.Time("last_pong", lastPong),
+			)
+			delete(h.clients, client)
+			close(client.send)
+			if client.heartbeatTicker != nil {
+				client.heartbeatTicker.Stop()
+			}
+			client.conn.Close()
+		}
+	}
+}
+
+// Stop gracefully shuts down the hub.
+func (h *Hub) Stop() {
+	close(h.done)
 }
 
 func NewServer(hub *Hub, engine *matching.MatchingEngine, logger *zap.Logger, port int) *Server {
@@ -136,11 +217,12 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &Client{
-		hub:    s.hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		subs:   make(map[types.Symbol]struct{}),
-		remote: r.RemoteAddr,
+		hub:          s.hub,
+		conn:         conn,
+		send:         make(chan []byte, 256),
+		subs:         make(map[types.Symbol]struct{}),
+		remote:       r.RemoteAddr,
+		lastPongTime: time.Now(),
 	}
 
 	s.hub.register <- client
@@ -176,9 +258,18 @@ func (c *Client) readPump() {
 	}()
 
 	c.conn.SetReadLimit(65536)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// Set initial read deadline: connection must send or pong within 2 heartbeat intervals + 10s buffer
+	readTimeout := 2*c.hub.heartbeatInterval + 10*time.Second
+	c.conn.SetReadDeadline(time.Now().Add(readTimeout))
+
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// Update the last pong timestamp when we receive a pong
+		c.mu.Lock()
+		c.lastPongTime = time.Now()
+		c.mu.Unlock()
+
+		// Reset read deadline on each pong
+		c.conn.SetReadDeadline(time.Now().Add(readTimeout))
 		return nil
 	})
 
@@ -200,7 +291,9 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(c.hub.heartbeatInterval)
+	c.heartbeatTicker = ticker
+
 	defer func() {
 		ticker.Stop()
 		c.conn.Close()
